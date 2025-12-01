@@ -1,4 +1,5 @@
 # .gitignore
 .venv/
 __pycache__/
+cifar10/
 *.pyc
