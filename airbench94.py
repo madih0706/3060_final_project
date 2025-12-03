@@ -17,6 +17,10 @@ import uuid
 from math import ceil
 
 import torch
+
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name())
+
 from torch import nn
 import torch.nn.functional as F
 import torchvision
@@ -464,7 +468,7 @@ def main(run):
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc
+    return tta_val_acc, total_time_seconds
 
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
@@ -472,8 +476,12 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     #main('warmup')
-    accs = torch.tensor([main(run) for run in range(25)])
-    print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
+    results = [main(run) for run in range(25)]  # returns (acc, time) tuples
+    accs = torch.tensor([r[0] for r in results])
+    times = torch.tensor([r[1] for r in results])
+
+    print('Mean accuracy: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
+    print('Mean total run time: %.4f s    Std: %.4f s' % (times.mean(), times.std()))
 
     log = {'code': code, 'accs': accs}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
