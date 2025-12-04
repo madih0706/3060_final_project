@@ -375,6 +375,7 @@ def main(run):
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
+    model = torch.compile(model)
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
