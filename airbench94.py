@@ -72,24 +72,29 @@ hyp = {
 #############################################
 
 CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465))
-CIFAR_STD = torch.tensor((0.2470, 0.2435, 0.2616))
+CIFAR_STD  = torch.tensor((0.2470, 0.2435, 0.2616))
 
 def batch_flip_lr(inputs):
-    flip_mask = (torch.rand(len(inputs), device=inputs.device) < 0.5).view(-1, 1, 1, 1)
-    return torch.where(flip_mask, inputs.flip(-1), inputs)
+    flip_mask = torch.rand(inputs.size(0), 1, 1, 1, device=inputs.device) < 0.5
+    return torch.where(flip_mask, torch.flip(inputs, dims=[-1]), inputs)
 
 def batch_crop(images, crop_size):
     r = (images.size(-1) - crop_size)//2
     shifts = torch.randint(-r, r+1, size=(len(images), 2), device=images.device)
-    images_out = torch.empty((len(images), 3, crop_size, crop_size), device=images.device, dtype=images.dtype)
-    # The two cropping methods in this if-else produce equivalent results, but the second is faster for r > 2.
+    images_out = torch.empty((len(images), 3, crop_size, crop_size),
+                             device=images.device, dtype=images.dtype)
+
     if r <= 2:
+        # For small r, direct slicing is faster
         for sy in range(-r, r+1):
             for sx in range(-r, r+1):
                 mask = (shifts[:, 0] == sy) & (shifts[:, 1] == sx)
-                images_out[mask] = images[mask, :, r+sy:r+sy+crop_size, r+sx:r+sx+crop_size]
+                images_out[mask] = images[mask, :, r+sy:r+sy+crop_size,
+                                                r+sx:r+sx+crop_size]
     else:
-        images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r), device=images.device, dtype=images.dtype)
+        # For large r, use 2-stage crop
+        images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r),
+                                 device=images.device, dtype=images.dtype)
         for s in range(-r, r+1):
             mask = (shifts[:, 0] == s)
             images_tmp[mask] = images[mask, :, r+s:r+s+crop_size, :]
@@ -98,71 +103,142 @@ def batch_crop(images, crop_size):
             images_out[mask] = images_tmp[mask, :, :, r+s:r+s+crop_size]
     return images_out
 
+
 class CifarLoader:
 
-    def __init__(self, path, train=True, batch_size=500, aug=None, drop_last=None, shuffle=None, gpu=0):
+    def __init__(self, path, train=True, batch_size=500, aug=None,
+                 drop_last=None, shuffle=None, gpu=0):
+
         data_path = os.path.join(path, 'train.pt' if train else 'test.pt')
         if not os.path.exists(data_path):
             dset = torchvision.datasets.CIFAR10(path, download=True, train=train)
             images = torch.tensor(dset.data)
             labels = torch.tensor(dset.targets)
-            torch.save({'images': images, 'labels': labels, 'classes': dset.classes}, data_path)
+            torch.save({'images': images, 'labels': labels,
+                        'classes': dset.classes}, data_path)
 
         data = torch.load(data_path, map_location=torch.device(gpu))
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
-        # It's faster to load+process uint8 data than to load preprocessed fp16 data
-        self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
 
-        self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
-        self.proc_images = {} # Saved results of image processing to be done on the first epoch
+        # Load uint8 as fp16 + channels_last for speed
+        self.images = (self.images.half() / 255).permute(0, 3, 1, 2)\
+                          .to(memory_format=torch.channels_last)
+
+        # Store preprocessing results
+        self.proc_images = {}
         self.epoch = 0
 
         self.aug = aug or {}
         for k in self.aug.keys():
-            assert k in ['flip', 'translate'], 'Unrecognized key: %s' % k
+            assert k in ['flip', 'translate'], f"Unrecognized key: {k}"
 
         self.batch_size = batch_size
         self.drop_last = train if drop_last is None else drop_last
         self.shuffle = train if shuffle is None else shuffle
 
+        # Precompute normalized images immediately
+        imgs = self.images
+        mu  = imgs.mean(dim=(0, 2, 3), keepdim=True)
+        std = imgs.std(dim=(0, 2, 3), keepdim=True)
+        self.mu = mu
+        self.std = std
+        self.proc_images['norm'] = (imgs - mu) / std
+
     def __len__(self):
-        return len(self.images)//self.batch_size if self.drop_last else ceil(len(self.images)/self.batch_size)
+        if self.drop_last:
+            return len(self.images) // self.batch_size
+        else:
+            return ceil(len(self.images) / self.batch_size)
 
     def __iter__(self):
 
+        ############################################################
+        #               First-epoch preprocessing                  #
+        #  (add vectorized whitening here — Method 3 modification) #
+        ############################################################
         if self.epoch == 0:
-            images = self.proc_images['norm'] = self.normalize(self.images)
-            # Pre-flip images in order to do every-other epoch flipping scheme
+
+            # ----------------------------
+            # Vectorized full-dataset whitening
+            # (x - mean) / std, per-channel
+            # ----------------------------
+            imgs = self.images
+
+            # Compute channelwise μ and σ lazily on GPU
+            mu  = imgs.mean(dim=(0, 2, 3), keepdim=True)
+            std = imgs.std(dim=(0, 2, 3), keepdim=True)
+
+            # Save for reuse (optional)
+            self.mu  = mu
+            self.std = std
+
+            # Apply whitening to entire dataset at once
+            whitened = (imgs - mu) / std
+
+            # Store whitened images
+            self.proc_images['whiten'] = whitened
+
+            self.proc_images['norm'] = whitened
+
+            # Pre-flip to support "every-other-epoch" global flip
             if self.aug.get('flip', False):
-                images = self.proc_images['flip'] = batch_flip_lr(images)
-            # Pre-pad images to save time when doing random translation
+                self.proc_images['flip'] = batch_flip_lr(whitened)
+            else:
+                self.proc_images['flip'] = whitened
+
+            # Pre-pad for random translation
             pad = self.aug.get('translate', 0)
             if pad > 0:
-                self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
+                self.proc_images['pad'] = F.pad(whitened, (pad,)*4, 'reflect')
+            else:
+                self.proc_images['pad'] = whitened
+
+        ############################################################
+        #                 Per-epoch augmentation                   #
+        ############################################################
 
         if self.aug.get('translate', 0) > 0:
+            # Random crop using pre-padded whitened images
             images = batch_crop(self.proc_images['pad'], self.images.shape[-2])
         elif self.aug.get('flip', False):
             images = self.proc_images['flip']
         else:
-            images = self.proc_images['norm']
-        # Flip all images together every other epoch. This increases diversity relative to random flipping
+            images = self.proc_images['whiten']
+
+        # Every-other-epoch global flip
         if self.aug.get('flip', False):
             if self.epoch % 2 == 1:
                 images = images.flip(-1)
 
-        self.epoch += 1
+        ############################################################
+        #                 Shuffle + batch yield                    #
+        ############################################################
 
-        indices = (torch.randperm if self.shuffle else torch.arange)(len(images), device=images.device)
+        indices = (torch.randperm if self.shuffle else torch.arange)(
+            len(images), device=images.device
+        )
+
         for i in range(len(self)):
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
             yield (images[idxs], self.labels[idxs])
-    
+
+
     @property
     def norm_test_images(self):
+        # For test set, apply the *same whitening statistics*
         if not hasattr(self, '_norm_test_images'):
-            self._norm_test_images = self.normalize(self.images)
+            self._norm_test_images = (self.images - self.mu) / self.std
         return self._norm_test_images
+
+    def set_epoch(self, epoch):
+        """
+        Called once per epoch from the training loop.
+        Controls:
+            - every-other-epoch flip
+            - first-epoch initialization
+        """
+        self.epoch = epoch
+
 
 #############################################
 #            Network Components             #
@@ -374,11 +450,14 @@ def main(run):
     lr_biases = lr * hyp['opt']['bias_scaler']
 
     loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
+
     test_loader = CifarLoader('cifar10', train=False, batch_size=2000)
     train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'])
+
     if run == 'warmup':
         # The only purpose of the first run is to warmup, so we can use dummy data
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
+
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
@@ -386,8 +465,10 @@ def main(run):
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
-    param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
-                     dict(params=other_params, lr=lr, weight_decay=wd/lr)]
+    param_configs = [
+        dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
+        dict(params=other_params, lr=lr, weight_decay=wd/lr)
+    ]
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
     def get_lr(step):
@@ -399,6 +480,7 @@ def main(run):
         else:
             frac = (step - warmup_steps) / warmdown_steps
             return 1.0 * (1 - frac) + 0.07 * frac
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
     alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
@@ -409,9 +491,12 @@ def main(run):
     ender = torch.cuda.Event(enable_timing=True)
     total_time_seconds = 0.0
 
-    # Initialize the whitening layer using training images
+    ########################################
+    # METHOD 3: Whitening init uses padded #
+    # + normalized images only             #
+    ########################################
     starter.record()
-    train_images = train_loader.normalize(train_loader.images[:5000])
+    train_images = train_loader.proc_images['norm'][:5000]
     init_whitening_conv(model[0], train_images)
     ender.record()
     torch.cuda.synchronize()
@@ -426,12 +511,25 @@ def main(run):
         ####################
 
         starter.record()
-
         model.train()
+
+        # METHOD 3 CHANGE: let loader refresh crops for this epoch
+        train_loader.set_epoch(epoch)
+
         for inputs, labels in train_loader:
+
+            ############################################
+            # METHOD 3 CHANGE:
+            # The loader now returns pre-padded and
+            # pre-random-cropped tensors directly.
+            ############################################
+            # inputs is already padded, cropped, normalized.
+            # No additional augmentation needed.
+            ############################################
 
             outputs = model(inputs)
             loss = loss_fn(outputs, labels).sum()
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
