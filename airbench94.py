@@ -71,37 +71,32 @@ hyp = {
 #                DataLoader                 #
 #############################################
 
-CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465))
-CIFAR_STD  = torch.tensor((0.2470, 0.2435, 0.2616))
+CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465), dtype=torch.half)
+CIFAR_STD = torch.tensor((0.2470, 0.2435, 0.2616), dtype=torch.half)
 
+@torch.compile()
 def batch_flip_lr(inputs):
-    flip_mask = torch.rand(inputs.size(0), 1, 1, 1, device=inputs.device) < 0.5
-    return torch.where(flip_mask, torch.flip(inputs, dims=[-1]), inputs)
+    flip_mask = (torch.rand(len(inputs), device=inputs.device) < 0.5).view(-1, 1, 1, 1)
+    return torch.where(flip_mask, inputs.flip(-1), inputs)
 
+@torch.compile()
 def batch_crop(images, crop_size):
-    r = (images.size(-1) - crop_size)//2
-    shifts = torch.randint(-r, r+1, size=(len(images), 2), device=images.device)
-    images_out = torch.empty((len(images), 3, crop_size, crop_size),
-                             device=images.device, dtype=images.dtype)
-
-    if r <= 2:
-        # For small r, direct slicing is faster
-        for sy in range(-r, r+1):
-            for sx in range(-r, r+1):
-                mask = (shifts[:, 0] == sy) & (shifts[:, 1] == sx)
-                images_out[mask] = images[mask, :, r+sy:r+sy+crop_size,
-                                                r+sx:r+sx+crop_size]
-    else:
-        # For large r, use 2-stage crop
-        images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r),
-                                 device=images.device, dtype=images.dtype)
-        for s in range(-r, r+1):
-            mask = (shifts[:, 0] == s)
-            images_tmp[mask] = images[mask, :, r+s:r+s+crop_size, :]
-        for s in range(-r, r+1):
-            mask = (shifts[:, 1] == s)
-            images_out[mask] = images_tmp[mask, :, :, r+s:r+s+crop_size]
-    return images_out
+    B, C, H_padded, W_padded = images.shape
+    r = (H_padded - crop_size) // 2
+    y_offsets = (torch.rand(B, device=images.device) * (2 * r + 1)).long()
+    x_offsets = (torch.rand(B, device=images.device) * (2 * r + 1)).long()
+    base_y_coords = torch.arange(crop_size, device=images.device).view(1, 1, crop_size, 1)
+    base_x_coords = torch.arange(crop_size, device=images.device).view(1, 1, 1, crop_size)
+    y_start_coords_expanded = y_offsets.view(B, 1, 1, 1)
+    x_start_coords_expanded = x_offsets.view(B, 1, 1, 1)
+    y_indices = y_start_coords_expanded + base_y_coords
+    y_indices = y_indices.expand(B, C, crop_size, crop_size)
+    x_indices = x_start_coords_expanded + base_x_coords
+    x_indices = x_indices.expand(B, C, crop_size, crop_size)
+    batch_indices = torch.arange(B, device=images.device).view(B, 1, 1, 1).expand_as(y_indices)
+    channel_indices = torch.arange(C, device=images.device).view(1, C, 1, 1).expand_as(y_indices)
+    cropped_images = images[batch_indices, channel_indices, y_indices, x_indices]
+    return cropped_images
 
 
 class CifarLoader:
@@ -117,7 +112,7 @@ class CifarLoader:
             torch.save({'images': images, 'labels': labels,
                         'classes': dset.classes}, data_path)
 
-        data = torch.load(data_path, map_location=torch.device(gpu))
+        data = torch.load(data_path, map_location=torch.device(gpu), weights_only=True)
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
 
         # Load uint8 as fp16 + channels_last for speed
@@ -136,13 +131,11 @@ class CifarLoader:
         self.drop_last = train if drop_last is None else drop_last
         self.shuffle = train if shuffle is None else shuffle
 
-        # Precompute normalized images immediately
-        imgs = self.images
-        mu  = imgs.mean(dim=(0, 2, 3), keepdim=True)
-        std = imgs.std(dim=(0, 2, 3), keepdim=True)
-        self.mu = mu
-        self.std = std
-        self.proc_images['norm'] = (imgs - mu) / std
+        # Create normalize transform with half precision
+        self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
+        
+        # Pre-allocate indices tensor for better performance
+        self._indices = torch.empty(len(self.images), dtype=torch.long, device=self.images.device)
 
     def __len__(self):
         if self.drop_last:
@@ -154,56 +147,35 @@ class CifarLoader:
 
         ############################################################
         #               First-epoch preprocessing                  #
-        #  (add vectorized whitening here — Method 3 modification) #
         ############################################################
         if self.epoch == 0:
-
-            # ----------------------------
-            # Vectorized full-dataset whitening
-            # (x - mean) / std, per-channel
-            # ----------------------------
-            imgs = self.images
-
-            # Compute channelwise μ and σ lazily on GPU
-            mu  = imgs.mean(dim=(0, 2, 3), keepdim=True)
-            std = imgs.std(dim=(0, 2, 3), keepdim=True)
-
-            # Save for reuse (optional)
-            self.mu  = mu
-            self.std = std
-
-            # Apply whitening to entire dataset at once
-            whitened = (imgs - mu) / std
-
-            # Store whitened images
-            self.proc_images['whiten'] = whitened
-
-            self.proc_images['norm'] = whitened
-
+            # Normalize images using the transform
+            images = self.proc_images['norm'] = self.normalize(self.images)
+            
             # Pre-flip to support "every-other-epoch" global flip
             if self.aug.get('flip', False):
-                self.proc_images['flip'] = batch_flip_lr(whitened)
+                images = self.proc_images['flip'] = batch_flip_lr(images)
             else:
-                self.proc_images['flip'] = whitened
+                images = self.proc_images['flip'] = images
 
             # Pre-pad for random translation
             pad = self.aug.get('translate', 0)
             if pad > 0:
-                self.proc_images['pad'] = F.pad(whitened, (pad,)*4, 'reflect')
+                self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
             else:
-                self.proc_images['pad'] = whitened
+                self.proc_images['pad'] = images
 
         ############################################################
         #                 Per-epoch augmentation                   #
         ############################################################
 
         if self.aug.get('translate', 0) > 0:
-            # Random crop using pre-padded whitened images
+            # Random crop using pre-padded normalized images
             images = batch_crop(self.proc_images['pad'], self.images.shape[-2])
         elif self.aug.get('flip', False):
             images = self.proc_images['flip']
         else:
-            images = self.proc_images['whiten']
+            images = self.proc_images['norm']
 
         # Every-other-epoch global flip
         if self.aug.get('flip', False):
@@ -214,30 +186,25 @@ class CifarLoader:
         #                 Shuffle + batch yield                    #
         ############################################################
 
-        indices = (torch.randperm if self.shuffle else torch.arange)(
-            len(images), device=images.device
-        )
+        if self.shuffle:
+            torch.randperm(len(self._indices), out=self._indices)
+            indices = self._indices
+        else:
+            indices = torch.arange(len(self.images), device=self.images.device)
 
         for i in range(len(self)):
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
             yield (images[idxs], self.labels[idxs])
 
+        # Increment epoch at the end
+        self.epoch += 1
 
     @property
     def norm_test_images(self):
-        # For test set, apply the *same whitening statistics*
+        # For test set, apply normalization
         if not hasattr(self, '_norm_test_images'):
-            self._norm_test_images = (self.images - self.mu) / self.std
+            self._norm_test_images = self.normalize(self.images)
         return self._norm_test_images
-
-    def set_epoch(self, epoch):
-        """
-        Called once per epoch from the training loop.
-        Controls:
-            - every-other-epoch flip
-            - first-epoch initialization
-        """
-        self.epoch = epoch
 
 
 #############################################
@@ -496,7 +463,8 @@ def main(run):
     # + normalized images only             #
     ########################################
     starter.record()
-    train_images = train_loader.proc_images['norm'][:5000]
+    with torch.no_grad():
+        train_images = train_loader.normalize(train_loader.images[:5000])
     init_whitening_conv(model[0], train_images)
     ender.record()
     torch.cuda.synchronize()
@@ -512,9 +480,6 @@ def main(run):
 
         starter.record()
         model.train()
-
-        # METHOD 3 CHANGE: let loader refresh crops for this epoch
-        train_loader.set_epoch(epoch)
 
         for inputs, labels in train_loader:
 
