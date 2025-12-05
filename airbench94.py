@@ -316,17 +316,12 @@ def print_training_details(variables, is_final_entry):
 ############################################
 
 def infer(model, loader, tta_level=0):
-
-    # Test-time augmentation strategy (for tta_level=2):
-    # 1. Flip/mirror the image left-to-right (50% of the time).
-    # 2. Translate the image by one pixel either up-and-left or down-and-right (50% of the time,
-    #    i.e. both happen 25% of the time).
-    #
-    # This creates 6 views per image (left/right times the two translations and no-translation),
-    # which we evaluate and then weight according to the given probabilities.
-
+    """
+    Efficient inference with cached normalized test images and no unnecessary .clone().
+    Applies test-time augmentation based on tta_level.
+    """
     def infer_basic(inputs, net):
-        return net(inputs).clone()
+        return net(inputs)
 
     def infer_mirror(inputs, net):
         return 0.5 * net(inputs) + 0.5 * net(inputs.flip(-1))
@@ -351,8 +346,14 @@ def infer(model, loader, tta_level=0):
         return torch.cat([infer_fn(inputs, model) for inputs in test_images.split(2000)])
 
 def evaluate(model, loader, tta_level=0):
+    """
+    Evaluates the model accuracy on the provided loader using the specified TTA level.
+    """
     logits = infer(model, loader, tta_level)
-    return (logits.argmax(1) == loader.labels).float().mean().item()
+    labels = loader.labels.cuda()
+    preds = logits.argmax(1)
+    acc = (preds == labels).float().mean().item()
+    return acc
 
 ############################################
 #                Training                  #
