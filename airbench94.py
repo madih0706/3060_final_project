@@ -57,9 +57,9 @@ hyp = {
     },
     'net': {
         'widths': {
-            'block1': 48,
-            'block2': 192,
-            'block3': 192,
+            'block1': 64,
+            'block2': 256,
+            'block3': 256,
         },
         'batchnorm_momentum': 0.6,
         'scaling_factor': 1/9,
@@ -157,6 +157,12 @@ class CifarLoader:
         for i in range(len(self)):
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
             yield (images[idxs], self.labels[idxs])
+    
+    @property
+    def norm_test_images(self):
+        if not hasattr(self, '_norm_test_images'):
+            self._norm_test_images = self.normalize(self.images)
+        return self._norm_test_images
 
 #############################################
 #            Network Components             #
@@ -339,7 +345,7 @@ def infer(model, loader, tta_level=0):
         return 0.5 * logits + 0.5 * logits_translate
 
     model.eval()
-    test_images = loader.normalize(loader.images)
+    test_images = loader.norm_test_images
     infer_fn = [infer_basic, infer_mirror, infer_mirror_translate][tta_level]
     with torch.no_grad():
         return torch.cat([infer_fn(inputs, model) for inputs in test_images.split(2000)])
