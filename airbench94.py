@@ -301,8 +301,11 @@ def get_whitening_parameters(patches):
     n,c,h,w = patches.shape
     patches_flat = patches.view(n, -1)
     est_patch_covariance = (patches_flat.T @ patches_flat) / n
-    eigenvalues, eigenvectors = torch.linalg.eigh(est_patch_covariance, UPLO='U')
-    return eigenvalues.flip(0).view(-1, 1, 1, 1), eigenvectors.T.reshape(c*h*w,c,h,w).flip(0)
+    # Use SVD for better numerical stability (like cifar10_speedrun.py)
+    U, S, V = torch.svd(est_patch_covariance)
+    eigenvalues = S
+    eigenvectors = U.T
+    return eigenvalues.flip(0).view(-1, 1, 1, 1), eigenvectors.reshape(c*h*w,c,h,w).flip(0)
 
 def init_whitening_conv(layer, train_set, eps=5e-4):
     patches = get_patches(train_set, patch_shape=layer.weight.data.shape[2:])
@@ -364,7 +367,7 @@ def infer(model, loader, tta_level=0):
     Applies test-time augmentation based on tta_level.
     """
     def infer_basic(inputs, net):
-        return net(inputs)
+        return net(inputs).clone()
 
     def infer_mirror(inputs, net):
         return 0.5 * net(inputs) + 0.5 * net(inputs.flip(-1))
@@ -430,29 +433,6 @@ def main(run):
     model = make_net()
     current_steps = 0
 
-    norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
-    other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
-    param_configs = [
-        dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
-        dict(params=other_params, lr=lr, weight_decay=wd/lr)
-    ]
-    optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
-
-    def get_lr(step):
-        warmup_steps = int(total_train_steps * 0.23)
-        warmdown_steps = total_train_steps - warmup_steps
-        if step < warmup_steps:
-            frac = step / warmup_steps
-            return 0.2 * (1 - frac) + 1.0 * frac
-        else:
-            frac = (step - warmup_steps) / warmdown_steps
-            return 1.0 * (1 - frac) + 0.07 * frac
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
-
-    alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
-    lookahead_state = LookaheadState(model)
-
     # For accurately timing GPU code
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
@@ -470,9 +450,47 @@ def main(run):
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
+    # Compile model for better performance (after whitening init)
+    model = torch.compile(model, mode="max-autotune")
+
+    norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
+    other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
+    param_configs = [
+        dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
+        dict(params=other_params, lr=lr, weight_decay=wd/lr)
+    ]
+    # Use fused optimizer for better performance
+    optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True, fused=True)
+
+    def get_lr(step):
+        warmup_steps = int(total_train_steps * 0.23)
+        warmdown_steps = total_train_steps - warmup_steps
+        if step < warmup_steps:
+            frac = step / warmup_steps
+            return 0.2 * (1 - frac) + 1.0 * frac
+        else:
+            frac = (step - warmup_steps) / warmdown_steps
+            return 1.0 * (1 - frac) + 0.07 * frac
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+
+    alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
+    lookahead_state = LookaheadState(model)
+
+    # Compile the forward pass function with reduced overhead
+    @torch.compile(mode="max-autotune", fullgraph=True)
+    def forward_step(inputs, labels):
+        outputs = model(inputs)
+        loss = loss_fn(outputs, labels).sum()
+        return loss, outputs
+
     for epoch in range(ceil(epochs)):
 
-        model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
+        # Access the original model's first layer through _orig_mod
+        if hasattr(model, '_orig_mod'):
+            model._orig_mod[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
+        else:
+            model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
 
         ####################
         #     Training     #
@@ -492,8 +510,7 @@ def main(run):
             # No additional augmentation needed.
             ############################################
 
-            outputs = model(inputs)
-            loss = loss_fn(outputs, labels).sum()
+            loss, outputs = forward_step(inputs, labels)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -559,4 +576,3 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
     torch.save(log, os.path.join(log_dir, 'log.pt'))
-
