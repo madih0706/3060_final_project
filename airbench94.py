@@ -367,7 +367,7 @@ def infer(model, loader, tta_level=0):
     Applies test-time augmentation based on tta_level.
     """
     def infer_basic(inputs, net):
-        return net(inputs).clone()
+        return net(inputs)
 
     def infer_mirror(inputs, net):
         return 0.5 * net(inputs) + 0.5 * net(inputs.flip(-1))
@@ -433,26 +433,6 @@ def main(run):
     model = make_net()
     current_steps = 0
 
-    # For accurately timing GPU code
-    starter = torch.cuda.Event(enable_timing=True)
-    ender = torch.cuda.Event(enable_timing=True)
-    total_time_seconds = 0.0
-
-    ########################################
-    # METHOD 3: Whitening init uses padded #
-    # + normalized images only             #
-    ########################################
-    starter.record()
-    with torch.no_grad():
-        train_images = train_loader.normalize(train_loader.images[:5000])
-    init_whitening_conv(model[0], train_images)
-    ender.record()
-    torch.cuda.synchronize()
-    total_time_seconds += 1e-3 * starter.elapsed_time(ender)
-
-    # Compile model for better performance (after whitening init)
-    model = torch.compile(model, mode="max-autotune")
-
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
     param_configs = [
@@ -477,20 +457,26 @@ def main(run):
     alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
     lookahead_state = LookaheadState(model)
 
-    # Compile the forward pass function with reduced overhead
-    @torch.compile(mode="max-autotune", fullgraph=True)
-    def forward_step(inputs, labels):
-        outputs = model(inputs)
-        loss = loss_fn(outputs, labels).sum()
-        return loss, outputs
+    # For accurately timing GPU code
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
+    total_time_seconds = 0.0
+
+    ########################################
+    # METHOD 3: Whitening init uses padded #
+    # + normalized images only             #
+    ########################################
+    starter.record()
+    with torch.no_grad():
+        train_images = train_loader.normalize(train_loader.images[:5000])
+    init_whitening_conv(model[0], train_images)
+    ender.record()
+    torch.cuda.synchronize()
+    total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     for epoch in range(ceil(epochs)):
 
-        # Access the original model's first layer through _orig_mod
-        if hasattr(model, '_orig_mod'):
-            model._orig_mod[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
-        else:
-            model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
+        model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
 
         ####################
         #     Training     #
@@ -510,7 +496,8 @@ def main(run):
             # No additional augmentation needed.
             ############################################
 
-            loss, outputs = forward_step(inputs, labels)
+            outputs = model(inputs)
+            loss = loss_fn(outputs, labels).sum()
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
