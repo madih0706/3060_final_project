@@ -304,23 +304,26 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
+
     def next_batch(self):
-        B = self.B
-        T = self.T
-        n = buf_np.shape[0]
-        self.host_buf[:n].copy_(torch.from_numpy(buf_np))
-
-        # now async copy into preallocated GPU tensors (non_blocking requires pinned host memory)
-        self.x_gpu.copy_(self.host_buf[:B * T].view(B, T), non_blocking=True)
-        self.y_gpu.copy_(self.host_buf[1:B * T + 1].view(B, T), non_blocking=True)
-
-        # --- advance current position and possibly load next shard ---
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-
-        # return ready-to-use GPU tensors
-        return self.x_gpu, self.y_gpu
+            B = self.B
+            T = self.T
+            # extract the chunk of tokens we need from the current shard
+            buf_np = self.tokens[self.current_position:self.current_position + B * T + 1].astype(np.int32)
+            n = buf_np.shape[0]
+            self.host_buf[:n].copy_(torch.from_numpy(buf_np))
+    
+            # now async copy into preallocated GPU tensors (non_blocking requires pinned host memory)
+            self.x_gpu.copy_(self.host_buf[:B * T].view(B, T), non_blocking=True)
+            self.y_gpu.copy_(self.host_buf[1:B * T + 1].view(B, T), non_blocking=True)
+    
+            # --- advance current position and possibly load next shard ---
+            self.current_position += B * T * self.num_processes
+            if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+                self.advance()
+    
+            # return ready-to-use GPU tensors
+            return self.x_gpu, self.y_gpu
 
 # -----------------------------------------------------------------------------
 # int main
@@ -334,7 +337,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 5100 # number of iterations to run
+    num_iterations : int = 1000 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -493,14 +496,14 @@ for step in range(args.num_iterations + 1):
         with ctx:
             _, loss = model(x, y, return_logits=False)
             train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
+        # advance the dataset for the next batch (AFTER backward pass)
+        x, y = train_loader.next_batch()
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # step the optimizers and schedulers
