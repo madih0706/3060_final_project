@@ -6,8 +6,6 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
-import threading
-import queue
 
 import numpy as np
 import torch
@@ -26,7 +24,6 @@ def zeropower_via_svd(G, steps=None):
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    
     # Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     # quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
     # of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
@@ -52,7 +49,6 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
 class Muon(torch.optim.Optimizer):
-    
     # Muon - MomentUm Orthogonalized by Newton-schulz
 
     # Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
@@ -239,11 +235,7 @@ class GPT(nn.Module):
         return logits, loss
 
 # -----------------------------------------------------------------------------
-# NOVEL: Asynchronous Distributed Data Loader with Prefetching
-# This loader eliminates I/O bottlenecks by:
-# 1. Using pinned memory for zero-copy transfers to GPU
-# 2. Prefetching batches in a background thread while GPU trains
-# 3. Fusing token loading, reshaping, and CUDA copy into single operation
+# Our own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
     # only reads the header, returns header data
@@ -272,130 +264,6 @@ def _load_data_shard(filename):
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
 
-class AsyncDistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes, prefetch_batches=3):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
-        self.prefetch_batches = prefetch_batches
-
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += int(shard_ntok)
-        self.ntok_total = ntok_total
-
-        # NOVEL: Initialize prefetching infrastructure
-        self.batch_queue = queue.Queue(maxsize=prefetch_batches)
-        self.prefetch_thread = None
-        self.stop_prefetch = threading.Event()
-        
-        # NOVEL: Pre-allocate pinned memory buffers for zero-copy transfers
-        # Pinned memory allows async GPU transfers without blocking CPU
-        self.pinned_buffers = []
-        for _ in range(prefetch_batches):
-            x_pinned = torch.empty((B, T), dtype=torch.long, pin_memory=True)
-            y_pinned = torch.empty((B, T), dtype=torch.long, pin_memory=True)
-            self.pinned_buffers.append((x_pinned, y_pinned))
-        self.buffer_idx = 0
-
-        # kick things off
-        self.reset()
-
-    def reset(self):
-        # Stop existing prefetch thread if any
-        if self.prefetch_thread is not None:
-            self.stop_prefetch.set()
-            self.prefetch_thread.join()
-            self.stop_prefetch.clear()
-            # Clear the queue
-            while not self.batch_queue.empty():
-                try:
-                    self.batch_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-        
-        # NOVEL: Start background prefetch thread
-        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-        self.prefetch_thread.start()
-
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def _prefetch_worker(self):
-        """
-        NOVEL: Background worker thread that continuously prepares batches.
-        This runs in parallel with GPU training, hiding I/O latency.
-        """
-        while not self.stop_prefetch.is_set():
-            try:
-                # Get a pinned buffer to fill
-                buffer_idx = self.buffer_idx
-                x_pinned, y_pinned = self.pinned_buffers[buffer_idx]
-                self.buffer_idx = (self.buffer_idx + 1) % len(self.pinned_buffers)
-                
-                # Load batch data from disk
-                B, T = self.B, self.T
-                buf = self.tokens[self.current_position : self.current_position + B*T + 1]
-                buf = buf.astype(np.int32)
-                
-                # NOVEL: Write directly to pinned memory (no extra copy)
-                x_np = buf[:-1].reshape(B, T)
-                y_np = buf[1:].reshape(B, T)
-                x_pinned.copy_(torch.from_numpy(x_np))
-                y_pinned.copy_(torch.from_numpy(y_np))
-                
-                # Advance position
-                self.current_position += B * T * self.num_processes
-                if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-                    self.advance()
-                
-                # Put batch in queue (blocks if queue is full, which is fine)
-                self.batch_queue.put((x_pinned, y_pinned, buffer_idx), timeout=1.0)
-                
-            except queue.Full:
-                continue
-            except Exception as e:
-                if not self.stop_prefetch.is_set():
-                    print(f"Error in prefetch worker: {e}")
-                break
-
-    def next_batch(self):
-        """
-        NOVEL: Get next batch from prefetch queue.
-        This is non-blocking since batches are prepared in advance.
-        """
-        try:
-            x_pinned, y_pinned, buffer_idx = self.batch_queue.get(timeout=10.0)
-            # NOVEL: Async copy to GPU (non_blocking=True leverages pinned memory)
-            x_gpu = x_pinned.cuda(non_blocking=True)
-            y_gpu = y_pinned.cuda(non_blocking=True)
-            return x_gpu, y_gpu
-        except queue.Empty:
-            raise RuntimeError("Prefetch queue timeout - data loading too slow!")
-
-    def __del__(self):
-        # Clean shutdown of prefetch thread
-        if hasattr(self, 'prefetch_thread') and self.prefetch_thread is not None:
-            self.stop_prefetch.set()
-            self.prefetch_thread.join(timeout=2.0)
-
-# -----------------------------------------------------------------------------
-# Original synchronous data loader (for comparison/ablation)
-
 class DistributedDataLoader:
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
         self.process_rank = process_rank
@@ -415,6 +283,14 @@ class DistributedDataLoader:
             ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
 
+        # pinned host buffer (int32) with required max length B*T+1
+        self.host_buf = torch.empty((B * T + 1,), dtype=torch.int32, pin_memory=True)
+        # place GPU buffers on the currently selected CUDA device for this process
+        cur_dev = torch.cuda.current_device()
+        device_str = f'cuda:{cur_dev}'
+        self.x_gpu = torch.empty((B, T), dtype=torch.long, device=device_str)
+        self.y_gpu = torch.empty((B, T), dtype=torch.long, device=device_str)
+
         # kick things off
         self.reset()
 
@@ -428,18 +304,26 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
+
     def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x.cuda(), y.cuda()
+            B = self.B
+            T = self.T
+            # extract the chunk of tokens we need from the current shard
+            buf_np = self.tokens[self.current_position:self.current_position + B * T + 1].astype(np.int32)
+            n = buf_np.shape[0]
+            self.host_buf[:n].copy_(torch.from_numpy(buf_np))
+    
+            # now async copy into preallocated GPU tensors (non_blocking requires pinned host memory)
+            self.x_gpu.copy_(self.host_buf[:B * T].view(B, T), non_blocking=True)
+            self.y_gpu.copy_(self.host_buf[1:B * T + 1].view(B, T), non_blocking=True)
+    
+            # --- advance current position and possibly load next shard ---
+            self.current_position += B * T * self.num_processes
+            if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+                self.advance()
+    
+            # return ready-to-use GPU tensors
+            return self.x_gpu, self.y_gpu
 
 # -----------------------------------------------------------------------------
 # int main
@@ -453,7 +337,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 1000 # number of iterations to run
+    num_iterations : int = 5100 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -462,9 +346,6 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    # NOVEL: Async data loading hyperparams
-    use_async_loader : bool = True # enable async data loading with prefetching
-    prefetch_batches : int = 3 # number of batches to prefetch (more = better latency hiding, more memory)
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -487,22 +368,12 @@ val_steps = args.val_tokens // (B * T * ddp_world_size)
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-# NOVEL: Choose data loader based on configuration
-if args.use_async_loader:
-    DataLoaderClass = AsyncDistributedDataLoader
-    loader_kwargs = {'prefetch_batches': args.prefetch_batches}
-else:
-    DataLoaderClass = DistributedDataLoader
-    loader_kwargs = {}
-
 # load tokens
-train_loader = DataLoaderClass(args.input_bin, B, T, ddp_rank, ddp_world_size, **loader_kwargs)
-val_loader = DataLoaderClass(args.input_val_bin, B, T, ddp_rank, ddp_world_size, **loader_kwargs)
+train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-    if args.use_async_loader:
-        print(f"ASYNC DATA LOADING ENABLED: prefetching {args.prefetch_batches} batches with pinned memory")
 x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
@@ -557,17 +428,8 @@ if master_process:
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
-        # NOVEL: Log async data loading configuration
-        if args.use_async_loader:
-            f.write(f"ASYNC DATA LOADING ENABLED:\n")
-            f.write(f"  Prefetch batches: {args.prefetch_batches}\n")
-            f.write(f"  Using pinned memory for zero-copy GPU transfers\n")
-            f.write(f"  Background thread overlaps I/O with computation\n")
-            f.write('='*100 + '\n')
 
 training_time_ms = 0
-# NOVEL: Track data loading time separately to measure async benefit
-data_loading_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
@@ -580,7 +442,6 @@ for step in range(args.num_iterations + 1):
     # steps with dummy data first, and then re-initialize the model and reset the loader.
     if step == 10:
         training_time_ms = 0
-        data_loading_time_ms = 0
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
@@ -631,30 +492,18 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
-        # NOVEL: Time data loading separately to measure async benefit
-        if master_process and step > 10:
-            torch.cuda.synchronize()
-            t_data_start = time.time()
-        
         # forward pass
         with ctx:
             _, loss = model(x, y, return_logits=False)
             train_loss = loss.detach()
-        
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
-        
-        # NOVEL: Track data loading time
-        if master_process and step > 10:
-            torch.cuda.synchronize()
-            data_loading_time_ms += 1000 * (time.time() - t_data_start)
-        
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
+        # advance the dataset for the next batch (AFTER backward pass)
+        x, y = train_loader.next_batch()
     for p in model.parameters():
         p.grad /= train_accumulation_steps
     # step the optimizers and schedulers
@@ -669,12 +518,9 @@ for step in range(args.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        # NOVEL: Calculate and log data loading overhead
-        data_overhead_pct = (data_loading_time_ms / approx_time * 100) if approx_time > 0 else 0
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms data_overhead:{data_overhead_pct:.1f}%")
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms data_overhead:{data_overhead_pct:.1f}%\n")
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-    
