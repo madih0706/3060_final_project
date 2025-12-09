@@ -677,3 +677,4 @@ for step in range(args.num_iterations + 1):
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    
